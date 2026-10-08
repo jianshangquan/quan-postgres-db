@@ -1,0 +1,45 @@
+[package]
+name = "quan-erp-database"
+version = "0.1.0"
+edition = "2021"
+description = "Neon-style separated-storage Postgres (Rust): Raft safekeeper + pageserver + S3"
+rust-version = "1.87"
+default-run = "safekeeper"
+
+[[bin]]
+name = "safekeeper"
+path = "src/bin/safekeeper.rs"
+
+[[bin]]
+name = "pageserver"
+path = "src/bin/pageserver.rs"
+
+[[bin]]
+name = "objstore"
+path = "src/bin/objstore.rs"
+
+[[bin]]
+name = "smoke"
+path = "src/bin/smoke.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1"
+futures = "0.3"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

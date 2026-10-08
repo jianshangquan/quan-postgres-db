@@ -1,0 +1,13 @@
+{
+  "name": "database-go-2-test",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "insert-user": "node insert-country.js",
+    "insert-country": "node insert-country.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "pg": "^8.16.0"
+  }
+}

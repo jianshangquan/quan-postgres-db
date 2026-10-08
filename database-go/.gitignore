@@ -1,0 +1,9 @@
+**/bin/
+**/node_modules/
+**/.env
+*.db
+.DS_Store
+
+# Per-service bind mounts (./data/<service>)
+/data/
+!/data/.gitkeep

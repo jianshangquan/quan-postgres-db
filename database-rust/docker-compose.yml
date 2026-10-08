@@ -1,0 +1,138 @@
+x-sk-env: &sk-env
+  ROLE: safekeeper
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: quan-erp-pages
+  S3_ACCESS_KEY: minioadmin
+  S3_SECRET_KEY: minioadmin
+  S3_REGION: us-east-1
+  PAGESERVER_ADDR: pageserver:50051
+  SAFEKEEPER_PEERS: sk-1@safekeeper-1:7000:50051,sk-2@safekeeper-2:7000:50051,sk-3@safekeeper-3:7000:50051
+  RUST_LOG: info
+
+services:
+  minio:
+    build: .
+    entrypoint: ["objstore"]
+    environment:
+      LISTEN_ADDR: ":9000"
+      DATA_DIR: /data
+    volumes:
+      - minio-data:/data
+    ports:
+      - "29000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  minio-init:
+    build: .
+    entrypoint: ["sh", "-c", "curl -fsS -X PUT http://minio:9000/quan-erp-pages && echo ok"]
+    depends_on:
+      minio:
+        condition: service_started
+    restart: "no"
+
+  safekeeper-1:
+    build: .
+    entrypoint: ["safekeeper"]
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      <<: *sk-env
+      NODE_ID: sk-1
+      LISTEN_ADDR: ":50051"
+      HTTP_ADDR: ":8080"
+      DATA_DIR: /data
+      BOOTSTRAP: "true"
+    volumes:
+      - sk1-data:/data
+    ports:
+      - "25051:50051"
+      - "28080:8080"
+
+  safekeeper-2:
+    build: .
+    entrypoint: ["safekeeper"]
+    depends_on:
+      - minio
+      - safekeeper-1
+    environment:
+      <<: *sk-env
+      NODE_ID: sk-2
+      LISTEN_ADDR: ":50051"
+      HTTP_ADDR: ":8080"
+      DATA_DIR: /data
+      BOOTSTRAP: "false"
+    volumes:
+      - sk2-data:/data
+    ports:
+      - "25052:50051"
+      - "28082:8080"
+
+  safekeeper-3:
+    build: .
+    entrypoint: ["safekeeper"]
+    depends_on:
+      - minio
+      - safekeeper-1
+    environment:
+      <<: *sk-env
+      NODE_ID: sk-3
+      LISTEN_ADDR: ":50051"
+      HTTP_ADDR: ":8080"
+      DATA_DIR: /data
+      BOOTSTRAP: "false"
+    volumes:
+      - sk3-data:/data
+    ports:
+      - "25053:50051"
+      - "28083:8080"
+
+  pageserver:
+    build: .
+    entrypoint: ["pageserver"]
+    depends_on:
+      - minio
+    environment:
+      ROLE: pageserver
+      NODE_ID: pageserver-1
+      LISTEN_ADDR: ":50051"
+      HTTP_ADDR: ":8081"
+      DATA_DIR: /data
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: quan-erp-pages
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_REGION: us-east-1
+      RUST_LOG: info
+    volumes:
+      - pageserver-data:/data
+    ports:
+      - "25061:50051"
+      - "28081:8081"
+
+  compute:
+    build: ./compute
+    depends_on:
+      - safekeeper-1
+    environment:
+      POSTGRES_PASSWORD: postgres
+      SAFEKEEPER_HTTP: http://safekeeper-1:8080
+      TENANT_ID: default
+      TIMELINE_ID: main
+    ports:
+      - "25432:5432"
+    volumes:
+      - compute-pgdata:/var/lib/postgresql/data
+
+volumes:
+  minio-data:
+  sk1-data:
+  sk2-data:
+  sk3-data:
+  pageserver-data:
+  compute-pgdata:
