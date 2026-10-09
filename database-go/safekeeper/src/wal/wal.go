@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Wal is the safekeeper durable WAL store: append, merge, and serve segments.
@@ -15,6 +16,7 @@ type Wal struct {
 	mu  sync.Mutex
 	// tip caches FlushLSN per "tenant/timeline"
 	tip map[string]uint64
+	Appends atomic.Uint64
 }
 
 // NewWal opens (or creates) a WAL root directory.
@@ -31,6 +33,8 @@ func NewWal(dir string) (*Wal, error) {
 func tlKey(tenant, timeline string) string {
 	return tenant + "/" + timeline
 }
+
+func (w *Wal) Dir() string { return w.dir }
 
 func (w *Wal) timelineDir(tenant, timeline string) string {
 	return filepath.Join(w.dir, tenant, timeline)
@@ -50,8 +54,11 @@ func (w *Wal) segmentPath(tenant, timeline string, segno uint64) string {
 
 // CreateTimeline ensures tenant/timeline directories and zero meta exist.
 func (w *Wal) CreateTimeline(tenantID, timelineID string) error {
-	if tenantID == "" || timelineID == "" {
-		return errors.New("wal: tenant_id and timeline_id required")
+	if err := ValidateID(tenantID); err != nil {
+		return err
+	}
+	if err := ValidateID(timelineID); err != nil {
+		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -67,10 +74,13 @@ func (w *Wal) CreateTimeline(tenantID, timelineID string) error {
 }
 
 // Append stores a WAL frame, merging with any existing segment for the same segno.
-// Returns the timeline flush LSN (tip) after the write.
+// Fsyncs the segment and directory before returning. Returns the timeline flush LSN.
 func (w *Wal) Append(tenantID, timelineID string, startLSN, endLSN uint64, payload []byte) (flushLSN uint64, err error) {
-	if tenantID == "" || timelineID == "" {
-		return 0, errors.New("wal: tenant_id and timeline_id required")
+	if err := ValidateID(tenantID); err != nil {
+		return 0, err
+	}
+	if err := ValidateID(timelineID); err != nil {
+		return 0, err
 	}
 	if len(payload) == 0 {
 		return 0, errors.New("wal: empty payload")
@@ -104,11 +114,29 @@ func (w *Wal) Append(tenantID, timelineID string, startLSN, endLSN uint64, paylo
 	enc := EncodeFrame(chosen)
 	path := w.segmentPath(tenantID, timelineID, segno)
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, enc, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := f.Write(enc); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return 0, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return 0, err
+	}
+	if err := syncDir(w.walDir(tenantID, timelineID)); err != nil {
 		return 0, err
 	}
 
@@ -121,8 +149,12 @@ func (w *Wal) Append(tenantID, timelineID string, startLSN, endLSN uint64, paylo
 		if err := w.writeMetaLocked(meta); err != nil {
 			return 0, err
 		}
+		if err := syncDir(w.timelineDir(tenantID, timelineID)); err != nil {
+			return 0, err
+		}
 	}
 	w.tip[tlKey(tenantID, timelineID)] = meta.FlushLSN
+	w.Appends.Add(1)
 	return meta.FlushLSN, nil
 }
 
@@ -174,6 +206,36 @@ func (w *Wal) ListSegments(tenantID, timelineID string) ([]uint64, error) {
 	return out, nil
 }
 
+// ListTimelines returns tenant/timeline pairs under the data dir.
+func (w *Wal) ListTimelines() ([][2]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out [][2]string
+	tenants, err := os.ReadDir(w.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, t := range tenants {
+		if !t.IsDir() {
+			continue
+		}
+		tls, err := os.ReadDir(filepath.Join(w.dir, t.Name()))
+		if err != nil {
+			continue
+		}
+		for _, tl := range tls {
+			if !tl.IsDir() {
+				continue
+			}
+			out = append(out, [2]string{t.Name(), tl.Name()})
+		}
+	}
+	return out, nil
+}
+
 // FlushLSN returns the highest durable LSN for the timeline.
 func (w *Wal) FlushLSN(tenantID, timelineID string) (uint64, error) {
 	w.mu.Lock()
@@ -190,4 +252,49 @@ func (w *Wal) FlushLSN(tenantID, timelineID string) (uint64, error) {
 	}
 	w.tip[tlKey(tenantID, timelineID)] = meta.FlushLSN
 	return meta.FlushLSN, nil
+}
+
+// MaxFlushLSN returns the highest flush LSN across all timelines.
+func (w *Wal) MaxFlushLSN() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var max uint64
+	for _, v := range w.tip {
+		if v > max {
+			max = v
+		}
+	}
+	if max > 0 {
+		return max
+	}
+	tenants, _ := os.ReadDir(w.dir)
+	for _, t := range tenants {
+		if !t.IsDir() {
+			continue
+		}
+		tls, _ := os.ReadDir(filepath.Join(w.dir, t.Name()))
+		for _, tl := range tls {
+			if !tl.IsDir() {
+				continue
+			}
+			meta, err := w.readMetaLocked(t.Name(), tl.Name())
+			if err != nil {
+				continue
+			}
+			w.tip[tlKey(t.Name(), tl.Name())] = meta.FlushLSN
+			if meta.FlushLSN > max {
+				max = meta.FlushLSN
+			}
+		}
+	}
+	return max
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

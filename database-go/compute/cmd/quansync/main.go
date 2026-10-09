@@ -5,6 +5,8 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -36,15 +38,19 @@ func main() {
 		fail("pgdata required")
 	}
 
-	cli := &http.Client{Timeout: 60 * time.Second}
-	ensureTimeline(cli, *pageserver, *tenant, *timeline)
+	cli := tlsHTTPClient(60 * time.Second)
+	bases := pageserverBases(*pageserver)
+	if len(bases) == 0 {
+		fail("set PAGESERVER_HTTP or QUAN_PAGESERVER_HTTP_URLS")
+	}
+	ensureTimeline(cli, bases[0], *tenant, *timeline)
 
 	if *baseOnly {
 		tarBytes, err := buildBaseTar(*pgdata)
 		if err != nil {
 			fail(err.Error())
 		}
-		if err := putBase(cli, *pageserver, *tenant, *timeline, tarBytes); err != nil {
+		if err := putBaseAny(cli, bases, *tenant, *timeline, tarBytes); err != nil {
 			fail(err.Error())
 		}
 		fmt.Printf("quansync: basebackup-only (%d bytes)\n", len(tarBytes))
@@ -92,7 +98,7 @@ func main() {
 				return err
 			}
 			pageLSN := *lsn + uint64(block)
-			if err := putPage(cli, *pageserver, *tenant, *timeline, dbOid, filenode, fork, block, pageLSN, buf); err != nil {
+			if err := putPageAny(cli, bases, *tenant, *timeline, dbOid, filenode, fork, block, pageLSN, buf); err != nil {
 				return err
 			}
 			uploaded++
@@ -111,7 +117,7 @@ func main() {
 	if err != nil {
 		fail("base tar: " + err.Error())
 	}
-	if err := putBase(cli, *pageserver, *tenant, *timeline, tarBytes); err != nil {
+	if err := putBaseAny(cli, bases, *tenant, *timeline, tarBytes); err != nil {
 		fail("basebackup: " + err.Error())
 	}
 	fmt.Printf("quansync: uploaded %d pages + basebackup (%d bytes) lsn_base=%d\n", uploaded, len(tarBytes), *lsn)
@@ -300,6 +306,64 @@ func putBase(cli *http.Client, base, tenant, timeline string, archive []byte) er
 		return fmt.Errorf("put base: %s", string(b))
 	}
 	return nil
+}
+
+func putPageAny(cli *http.Client, bases []string, tenant, timeline string, db, rel, fork, block uint32, lsn uint64, page []byte) error {
+	var last error
+	for _, base := range bases {
+		if err := putPage(cli, base, tenant, timeline, db, rel, fork, block, lsn, page); err != nil {
+			last = err
+			continue
+		}
+		return nil
+	}
+	return last
+}
+
+func putBaseAny(cli *http.Client, bases []string, tenant, timeline string, archive []byte) error {
+	var last error
+	for _, base := range bases {
+		if err := putBase(cli, base, tenant, timeline, archive); err != nil {
+			last = err
+			continue
+		}
+		return nil
+	}
+	return last
+}
+
+func pageserverBases(flagVal string) []string {
+	if multi := os.Getenv("QUAN_PAGESERVER_HTTP_URLS"); multi != "" {
+		var out []string
+		for _, p := range strings.Split(multi, ",") {
+			p = strings.TrimSpace(strings.TrimRight(p, "/"))
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	flagVal = strings.TrimSpace(strings.TrimRight(flagVal, "/"))
+	if flagVal != "" {
+		return []string{flagVal}
+	}
+	return nil
+}
+
+func tlsHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	caPath := env("QUAN_TLS_CA", env("TLS_CA_FILE", ""))
+	if caPath != "" {
+		if pem, err := os.ReadFile(caPath); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(pem) {
+				transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+			}
+		}
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
 func env(k, def string) string {

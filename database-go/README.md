@@ -1,89 +1,110 @@
-# database-go-2
+# database-go
 
-Minimal Neon-style split: compute → safekeeper → pageserver.
+Neon-style split with a **3-safekeeper quorum**, TLS, and a catching-up pageserver replica.
 
 ```
-compute (patched PG, optional)
-    │ WAL: walstreamer / archive → TCP QWAL :5454
-    │ GetPage ←──────────────────────────── HTTP :8081
+compute (patched PG)
+    │ WAL: walstreamer / archive → TCP QWAL over TLS (quorum 2 of 3)
+    │ GetPage/PutPage ←────────────── HTTPS (primary; URLs list for read failover)
     ▼
-safekeeper :5454 (QWAL) + :8080 (restore HTTP)
+safekeeper-1..3  TCP :5454 (QWAL+TLS) + HTTPS :8080 (restore / peer pull)
     │
-    ▼  HTTP POST /v1/ingest
-pageserver :8081          page layers + GetPage + basebackup
+    ▼  pageserver pulls /wal (FPI catch-up only)
+pageserver (primary) + pageserver-2 (replica)
+    PutPage/basebackup: sync fanout to peer before ACK
 ```
 
-Stock Postgres.app can still feed the stack via `walstreamer/` alone (read-only copy-out).  
-For GetPage-native compute, use `compute/` (Docker).
+## Consistency model
+
+- **PutPage / basebackup are authoritative** for page state. The primary sync-replicates to configured peers (`PAGESERVER_PEER_URLS`) and only then ACKs the client.
+- WAL apply on the pageserver remains **FPI-only** (full-page images) for catch-up/bootstrap — non-FPI records are not redone.
+- **Reads** may fail over across `QUAN_PAGESERVER_HTTP_URLS`. **Writes** still require the primary (replica rejects external PUT); there is no automatic promotion.
+
+## Auth + TLS
+
+All components require `QUAN_STORAGE_TOKEN`:
+
+- HTTPS: `Authorization: Bearer …` or `X-Quan-Token` (except `/healthz`)
+- QWAL TCP: TLS wrap + `QWAU` handshake before appends
+
+Dev certs live under [`certs/`](certs/) (`./certs/gen-certs.sh`). Compose mounts them and sets `TLS_CERT_FILE` / `TLS_KEY_FILE` / `QUAN_TLS_CA`.
+
+Copy [`.env.example`](.env.example) to `.env` and set token + `POSTGRES_PASSWORD`.
+
+## Run (compose)
+
+```bash
+cp .env.example .env
+# edit QUAN_STORAGE_TOKEN and POSTGRES_PASSWORD
+./certs/gen-certs.sh   # if certs missing
+docker compose --env-file .env up --build
+```
+
+| Service | Ports |
+|---------|-------|
+| pageserver (primary) | 8081 |
+| pageserver-2 (replica) | 8082 |
+| safekeeper-1 | 5454 / 8080 |
+| safekeeper-2 | 5455 / 8083 |
+| safekeeper-3 | 5456 / 8084 |
+| compute | 5432 |
 
 ## Layout
 
 | Dir | Role |
 |-----|------|
-| `walstreamer/` | Tail `pg_wal`, push QWAL frames to safekeeper |
-| `safekeeper/` | TCP WAL ingest + HTTP restore, fanout to pageserver |
-| `pageserver/` | Ingest WAL → FPI pages; GetPage / PutPage / basebackup |
+| `walstreamer/` | Tail `pg_wal`, push QWAL to all safekeepers (quorum) |
+| `safekeeper/` | TCP WAL ingest (fsync before ack) + HTTPS restore + peer heal |
+| `pageserver/` | Pull WAL → FPI; GetPage / PutPage / image layers + GC |
 | `compute/` | Patched Postgres 16 smgr + seed/restore helpers |
+| `test/chaos/` | Crash / quorum / soak scripts |
 
-## Run (3 terminals)
+## Local (plaintext, single safekeeper)
 
-Replace `PGDATA` with your cluster (example is Postgres.app 17):
-
-```bash
-export PGDATA="/Users/jianshangquan/Library/Application Support/Postgres/var-17"
-```
-
-**1. Pageserver**
+Omit TLS env vars for unit tests / quick smoke:
 
 ```bash
-cd serverless/database-go-2/pageserver
-LISTEN_ADDR=:8081 DATA_DIR=./data go run ./src/
+export QUAN_STORAGE_TOKEN=dev-token
+export PGDATA="/path/to/pgdata"
+
+cd pageserver && LISTEN_ADDR=:8081 DATA_DIR=./data \
+  SAFEKEEPER_HTTP_URLS=http://127.0.0.1:8080 go run ./src/
+
+cd safekeeper && LISTEN_ADDR=:5454 DATA_DIR=./data go run ./src/
+
+cd walstreamer && go run ./src/ \
+  -pgdata="$PGDATA" -safekeeper=127.0.0.1:5454
 ```
-
-**2. Safekeeper**
-
-```bash
-cd serverless/database-go-2/safekeeper
-LISTEN_ADDR=:5454 DATA_DIR=./data PAGESERVER_URL=http://127.0.0.1:8081 go run ./src/
-```
-
-**3. Walstreamer**
-
-```bash
-cd serverless/database-go-2/walstreamer
-go run ./src/ \
-  -pgdata="$PGDATA" \
-  -safekeeper=127.0.0.1:5454
-```
-
-## Smoke
-
-```bash
-psql -h 127.0.0.1 -U postgres -c "CREATE TABLE IF NOT EXISTS t(i int); INSERT INTO t VALUES (1);"
-psql -h 127.0.0.1 -U postgres -c "SELECT pg_switch_wal();"
-```
-
-Expect:
-
-- walstreamer: `streamed 0000000… +N bytes`
-- safekeeper: `wal append …`
-- pageserver: ingest OK (check `GET http://127.0.0.1:8081/v1/timeline?tenant=default&timeline=main`)
 
 ## Env
 
-| Component | Var | Default |
-|-----------|-----|---------|
-| safekeeper | `LISTEN_ADDR` | `:5454` |
-| safekeeper | `DATA_DIR` | `./data` |
-| safekeeper | `PAGESERVER_URL` | `http://127.0.0.1:8081` |
-| pageserver | `LISTEN_ADDR` | `:8081` |
-| pageserver | `DATA_DIR` | `./data` |
-| walstreamer | `-pgdata` / `PGDATA` | required |
-| walstreamer | `-safekeeper` | `127.0.0.1:5454` |
-| walstreamer | `-pgurl` | `postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable` |
+| Component | Var | Notes |
+|-----------|-----|-------|
+| all | `QUAN_STORAGE_TOKEN` | required |
+| all | `TLS_CERT_FILE` / `TLS_KEY_FILE` | enable HTTPS / QWAL TLS |
+| clients | `QUAN_TLS_CA` / `TLS_CA_FILE` | trust store |
+| safekeeper | `SAFEKEEPER_PEERS` | peer HTTPS bases for segment heal |
+| pageserver | `SAFEKEEPER_HTTP_URLS` | pull WAL list/fetch |
+| pageserver | `PAGESERVER_ROLE` | `primary` or `replica` |
+| pageserver | `PAGESERVER_PEER_URLS` | sync fanout targets (comma-separated) |
+| pageserver | `CACHE_PAGES` | default 8192 |
+| compute | `QUAN_PAGESERVER_HTTP_URLS` | read failover list |
+| walstreamer / qwal | `SAFEKEEPER_ADDRS` | comma-separated host:ports |
+| walstreamer / qwal | `QUORUM` | default majority |
+
+## Storage
+
+New `PutPage` values append into **image layer** files under `imagelayers/` (~16 MiB), with a JSON `.idx` sidecar. Legacy one-file-per-version paths are still readable; `CompactLoose` packs them into layers. GC keeps the newest LSN per block.
+
+## Chaos
+
+```bash
+./test/chaos/run.sh
+```
+
+See [`test/chaos/README.md`](test/chaos/README.md).
 
 ## Notes
 
-- Stock Postgres does **not** dial safekeeper; **walstreamer** is required.
-- WAL segment files are always 16 MiB; walstreamer tracks flush LSN so inserts into the current/recycled segment still stream.
-- Pageserver HTTP is intentional (compute GetPage + safekeeper ingest). Safekeeper↔compute is TCP (`QWAL`), not HTTP.
+- Tenant/timeline IDs must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
+- Replica rejects external `PUT` unless `X-Quan-Peer: 1` is set with a valid token.

@@ -5,23 +5,36 @@
 set -euo pipefail
 
 export PGDATA="${PGDATA:-/var/lib/postgresql/data}"
-export PAGESERVER_HTTP="${PAGESERVER_HTTP:-http://pageserver:8081}"
-export SAFEKEEPER_ADDR="${SAFEKEEPER_ADDR:-safekeeper:5454}"
-export SAFEKEEPER_HTTP="${SAFEKEEPER_HTTP:-http://safekeeper:8080}"
+export PAGESERVER_HTTP="${PAGESERVER_HTTP:-https://pageserver:8081}"
+export SAFEKEEPER_ADDR="${SAFEKEEPER_ADDR:-safekeeper-1:5454}"
+export SAFEKEEPER_ADDRS="${SAFEKEEPER_ADDRS:-$SAFEKEEPER_ADDR}"
+export SAFEKEEPER_HTTP="${SAFEKEEPER_HTTP:-https://safekeeper-1:8080}"
 export TENANT_ID="${TENANT_ID:-default}"
 export TIMELINE_ID="${TIMELINE_ID:-main}"
 export POSTGRES_USER="${POSTGRES_USER:-postgres}"
-export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-postgres}"
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+  echo "POSTGRES_PASSWORD is required" >&2
+  exit 1
+fi
+if [ -z "${QUAN_STORAGE_TOKEN:-}" ]; then
+  echo "QUAN_STORAGE_TOKEN is required" >&2
+  exit 1
+fi
 export POSTGRES_DB="${POSTGRES_DB:-app}"
-export PGURL="${PGURL:-postgres://${POSTGRES_USER}@127.0.0.1:5432/postgres?sslmode=disable}"
+export PGURL="${PGURL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/postgres?sslmode=disable}"
 export PATH="/usr/local/pgsql/bin:${PATH}"
+export QUAN_TLS_CA="${QUAN_TLS_CA:-${TLS_CA_FILE:-}}"
 
 # GetPage-first smgr hangs clients when pageserver is slow. Opt-in only.
 # Image ENV may still set QUAN_PAGESERVER_HTTP — ignore unless explicitly enabled.
 if [ "${QUAN_ENABLE_GETPAGE:-}" = "1" ]; then
   export QUAN_PAGESERVER_HTTP="${QUAN_PAGESERVER_HTTP:-$PAGESERVER_HTTP}"
+  if [ -z "${QUAN_PAGESERVER_HTTP_URLS:-}" ]; then
+    export QUAN_PAGESERVER_HTTP_URLS="${QUAN_PAGESERVER_HTTP},${PAGESERVER_HTTP}"
+  fi
 else
   unset QUAN_PAGESERVER_HTTP || true
+  unset QUAN_PAGESERVER_HTTP_URLS || true
 fi
 
 HELPER_PIDS=()
@@ -30,7 +43,8 @@ cleanup() {
   echo "entrypoint: shutting down helpers + postgres..."
   if gosu postgres pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
     if [ "${QUAN_DISABLE_PERIODIC_SYNC:-}" != "1" ]; then
-      gosu postgres env PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
+      gosu postgres env PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" \
+        QUAN_STORAGE_TOKEN="$QUAN_STORAGE_TOKEN" TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
         quansync -pgdata="$PGDATA" || true
     fi
     gosu postgres pg_ctl -D "$PGDATA" -m fast stop -t 20 || true
@@ -44,18 +58,32 @@ trap cleanup SIGTERM SIGINT
 mkdir -p "$PGDATA" /var/run/postgresql
 chown -R postgres:postgres "$PGDATA" /var/run/postgresql
 
+curl_tls_args() {
+  if [ -n "${QUAN_TLS_CA:-}" ] && [ -f "${QUAN_TLS_CA}" ]; then
+    echo --cacert "${QUAN_TLS_CA}"
+  elif [[ "${1:-}" == https://* ]]; then
+    echo -k
+  fi
+}
+
 curl_auth() {
+  local tls
+  tls=$(curl_tls_args "${1:-}")
+  # shellcheck disable=SC2086
   if [ -n "${QUAN_STORAGE_TOKEN:-}" ]; then
-    curl -fsS -H "Authorization: Bearer ${QUAN_STORAGE_TOKEN}" -H "X-Quan-Token: ${QUAN_STORAGE_TOKEN}" "$@"
+    curl -fsS $tls -H "Authorization: Bearer ${QUAN_STORAGE_TOKEN}" -H "X-Quan-Token: ${QUAN_STORAGE_TOKEN}" "$@"
   else
-    curl -fsS "$@"
+    curl -fsS $tls "$@"
   fi
 }
 
 wait_http() {
   local url="$1" name="$2"
+  local tls
+  tls=$(curl_tls_args "$url")
   for _ in $(seq 1 90); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if curl -fsS $tls "$url" >/dev/null 2>&1; then
       echo "$name ready"
       return 0
     fi
@@ -97,10 +125,12 @@ start_helpers() {
   else
     gosu postgres env \
       PGDATA="$PGDATA" \
-      SAFEKEEPER_ADDR="$SAFEKEEPER_ADDR" \
+      SAFEKEEPER_ADDRS="$SAFEKEEPER_ADDRS" \
+      QUAN_STORAGE_TOKEN="$QUAN_STORAGE_TOKEN" \
+      QUORUM="${QUORUM:-2}" \
       TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
       PGURL="$PGURL" \
-      walstreamer -pgdata="$PGDATA" -safekeeper="$SAFEKEEPER_ADDR" &
+      walstreamer -pgdata="$PGDATA" -safekeepers="$SAFEKEEPER_ADDRS" &
     HELPER_PIDS+=($!)
   fi
   if [ "${QUAN_DISABLE_PERIODIC_SYNC:-}" = "1" ]; then
@@ -112,7 +142,8 @@ start_helpers() {
       sleep 30
       if gosu postgres pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
         gosu postgres env \
-          PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
+          PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" QUAN_STORAGE_TOKEN="$QUAN_STORAGE_TOKEN" \
+          TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
           quansync -pgdata="$PGDATA" || true
       fi
     done
@@ -201,7 +232,8 @@ if [ "$FIRST_BOOT" = "1" ]; then
   gosu postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CHECKPOINT; SELECT pg_switch_wal(); CHECKPOINT; SELECT pg_switch_wal();"
   sleep 3
   LSN_NUM=$(gosu postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint;")
-  gosu postgres env PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
+  gosu postgres env PGDATA="$PGDATA" PAGESERVER_HTTP="$PAGESERVER_HTTP" QUAN_STORAGE_TOKEN="$QUAN_STORAGE_TOKEN" \
+    TENANT_ID="$TENANT_ID" TIMELINE_ID="$TIMELINE_ID" \
     QUAN_PAGE_LSN="${LSN_NUM:-1}" \
     quansync -pgdata="$PGDATA"
   echo "Seed complete (lsn=$LSN num=$LSN_NUM)"
@@ -226,12 +258,14 @@ touch "$PGDATA/.quan_compute_ready"
 chown postgres:postgres "$PGDATA/.quan_compute_ready" 2>/dev/null || true
 
 COMMON_ENV=(
-  QUAN_STORAGE_TOKEN="${QUAN_STORAGE_TOKEN:-}"
+  QUAN_STORAGE_TOKEN="$QUAN_STORAGE_TOKEN"
   TENANT_ID="$TENANT_ID"
   TIMELINE_ID="$TIMELINE_ID"
   SAFEKEEPER_ADDR="$SAFEKEEPER_ADDR"
+  SAFEKEEPER_ADDRS="$SAFEKEEPER_ADDRS"
   SAFEKEEPER_HTTP="$SAFEKEEPER_HTTP"
   PAGESERVER_HTTP="$PAGESERVER_HTTP"
+  QUORUM="${QUORUM:-2}"
 )
 
 # Primary compute always reads latest pages. A pinned QUAN_REQUEST_LSN hides

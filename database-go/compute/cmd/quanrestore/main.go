@@ -5,6 +5,8 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -40,15 +42,19 @@ func main() {
 	if *pgdata == "" {
 		fail("pgdata required")
 	}
-	cli := &http.Client{Timeout: 10 * time.Minute}
+	cli := tlsHTTPClient(10 * time.Minute)
+	psBase := firstPageserverBase(*pageserver)
+	if psBase == "" {
+		fail("set PAGESERVER_HTTP or QUAN_PAGESERVER_HTTP_URLS")
+	}
 
-	st, err := timelineStatus(cli, *pageserver, *tenant, *timeline)
+	st, err := timelineStatus(cli, psBase, *tenant, *timeline)
 	if err != nil {
 		fail("timeline status: " + err.Error())
 	}
 	if !st {
 		// Allow basebackup-only timelines (page_count may still be 0).
-		if _, err := getBytes(cli, fmt.Sprintf("%s/v1/basebackup?tenant=%s&timeline=%s", *pageserver, *tenant, *timeline)); err != nil {
+		if _, err := getBytes(cli, fmt.Sprintf("%s/v1/basebackup?tenant=%s&timeline=%s", psBase, *tenant, *timeline)); err != nil {
 			fail("timeline not found on pageserver; cannot restore")
 		}
 	}
@@ -57,7 +63,7 @@ func main() {
 		fail(err.Error())
 	}
 
-	base, err := getBytes(cli, fmt.Sprintf("%s/v1/basebackup?tenant=%s&timeline=%s", *pageserver, *tenant, *timeline))
+	base, err := getBytes(cli, fmt.Sprintf("%s/v1/basebackup?tenant=%s&timeline=%s", psBase, *tenant, *timeline))
 	if err != nil {
 		fail("basebackup: " + err.Error())
 	}
@@ -77,11 +83,11 @@ func main() {
 	}
 	ensurePGVersion(*pgdata)
 
-	refs, _ := listPages(cli, *pageserver, *tenant, *timeline)
+	refs, _ := listPages(cli, psBase, *tenant, *timeline)
 	nFiles := touchRelationStubs(*pgdata, refs)
 
 	if *full {
-		snap, err := getBytes(cli, fmt.Sprintf("%s/v1/snapshot?tenant=%s&timeline=%s", *pageserver, *tenant, *timeline))
+		snap, err := getBytes(cli, fmt.Sprintf("%s/v1/snapshot?tenant=%s&timeline=%s", psBase, *tenant, *timeline))
 		if err != nil {
 			fail("snapshot: " + err.Error())
 		}
@@ -357,6 +363,32 @@ func extractTar(archive []byte, dest string) error {
 func u32(s string) uint32 {
 	v, _ := strconv.ParseUint(s, 10, 32)
 	return uint32(v)
+}
+
+func firstPageserverBase(flagVal string) string {
+	if multi := os.Getenv("QUAN_PAGESERVER_HTTP_URLS"); multi != "" {
+		for _, p := range strings.Split(multi, ",") {
+			p = strings.TrimSpace(strings.TrimRight(p, "/"))
+			if p != "" {
+				return p
+			}
+		}
+	}
+	return strings.TrimSpace(strings.TrimRight(flagVal, "/"))
+}
+
+func tlsHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	caPath := env("QUAN_TLS_CA", env("TLS_CA_FILE", ""))
+	if caPath != "" {
+		if pem, err := os.ReadFile(caPath); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(pem) {
+				transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+			}
+		}
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
 func env(k, def string) string {

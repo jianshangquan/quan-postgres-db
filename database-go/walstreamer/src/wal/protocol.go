@@ -27,9 +27,47 @@ import (
 
 const (
 	WireMagic     = 0x5157414c // "QWAL"
+	AuthMagic     = 0x51574155 // "QWAU"
 	maxPayloadLen = 64 << 20
 	maxIDLen      = 512
+	maxTokenLen   = 4096
 )
+
+// WriteAuth sends the QWAU token handshake that must precede AppendMsg.
+func WriteAuth(w io.Writer, token string) error {
+	tb := []byte(token)
+	if len(tb) == 0 || len(tb) > maxTokenLen {
+		return errors.New("wal wire: bad token length")
+	}
+	var hdr [6]byte
+	binary.BigEndian.PutUint32(hdr[0:4], AuthMagic)
+	binary.BigEndian.PutUint16(hdr[4:6], uint16(len(tb)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(tb)
+	return err
+}
+
+// ReadAuth reads and returns the token from a QWAU handshake.
+func ReadAuth(r io.Reader) (string, error) {
+	var hdr [6]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", err
+	}
+	if binary.BigEndian.Uint32(hdr[0:4]) != AuthMagic {
+		return "", fmt.Errorf("wal wire: bad auth magic %#x", binary.BigEndian.Uint32(hdr[0:4]))
+	}
+	n := int(binary.BigEndian.Uint16(hdr[4:6]))
+	if n == 0 || n > maxTokenLen {
+		return "", errors.New("wal wire: bad auth token length")
+	}
+	tb := make([]byte, n)
+	if _, err := io.ReadFull(r, tb); err != nil {
+		return "", err
+	}
+	return string(tb), nil
+}
 
 // AppendMsg is one WAL chunk from compute.
 type AppendMsg struct {

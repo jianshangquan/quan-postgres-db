@@ -18,6 +18,8 @@ type Cache struct {
 	items map[key]entry
 	order []key
 	max   int
+	Hits  uint64
+	Miss  uint64
 }
 
 func NewCache(max int) *Cache {
@@ -50,8 +52,10 @@ func (c *Cache) Get(tenant, timeline string, dbOid, rel, fork, block uint32, req
 	k := key{tenant, timeline, dbOid, rel, fork, block}
 	e, ok := c.items[k]
 	if !ok || e.lsn > requestLSN {
+		c.Miss++
 		return nil, 0, false
 	}
+	c.Hits++
 	cp := make([]byte, len(e.page))
 	copy(cp, e.page)
 	return cp, e.lsn, true

@@ -9,14 +9,21 @@ import (
 // Service serves GetPage/PutPage/RelSize with a hot cache in front of Store.
 type Service struct {
 	store store.Store
+	disk  *store.Disk
 	cache *Cache
 }
 
 func NewService(st store.Store, cacheSize int) *Service {
-	return &Service{store: st, cache: NewCache(cacheSize)}
+	svc := &Service{store: st, cache: NewCache(cacheSize)}
+	if d, ok := st.(*store.Disk); ok {
+		svc.disk = d
+	}
+	return svc
 }
 
 func (s *Service) Store() store.Store { return s.store }
+func (s *Service) Cache() *Cache      { return s.cache }
+func (s *Service) Disk() *store.Disk  { return s.disk }
 
 func (s *Service) PutPage(ctx context.Context, tenant, timeline string, dbOid, rel, fork, block uint32, lsn uint64, page []byte) error {
 	if err := s.store.PutPage(ctx, tenant, timeline, dbOid, rel, fork, block, lsn, page); err != nil {
@@ -61,12 +68,15 @@ func (s *Service) EnsureTimeline(ctx context.Context, tenant, timeline string) e
 }
 
 func (s *Service) TimelineStatus(ctx context.Context, tenant, timeline string) (exists bool, lastLSN uint64, pageCount int, err error) {
-	// Meta only — never WalkDir the layer tree (bind mounts make that hang).
 	meta, metaErr := s.store.GetMeta(ctx, tenant, timeline)
 	if metaErr != nil {
 		return false, 0, 0, nil
 	}
-	return true, meta.LastLSN, meta.PageCount, nil
+	count := meta.PageCount
+	if s.disk != nil {
+		count = s.disk.Index().PageCount(tenant, timeline)
+	}
+	return true, meta.LastLSN, count, nil
 }
 
 func (s *Service) bumpMeta(ctx context.Context, tenant, timeline string, lsn uint64) error {
@@ -74,7 +84,11 @@ func (s *Service) bumpMeta(ctx context.Context, tenant, timeline string, lsn uin
 	if err != nil {
 		meta = store.TimelineMeta{TenantID: tenant, TimelineID: timeline}
 	}
-	meta.PageCount++
+	if s.disk != nil {
+		meta.PageCount = s.disk.Index().PageCount(tenant, timeline)
+	} else {
+		meta.PageCount++
+	}
 	if lsn > meta.LastLSN {
 		meta.LastLSN = lsn
 	}

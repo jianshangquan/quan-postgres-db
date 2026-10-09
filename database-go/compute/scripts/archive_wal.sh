@@ -4,7 +4,8 @@ set -euo pipefail
 
 PATH_FILE="${1:?}"
 FILE_NAME="${2:?}"
-SAFEKEEPER_ADDR="${SAFEKEEPER_ADDR:-127.0.0.1:5454}"
+SAFEKEEPER_ADDR="${SAFEKEEPER_ADDR:-}"
+SAFEKEEPER_ADDRS="${SAFEKEEPER_ADDRS:-$SAFEKEEPER_ADDR}"
 TENANT="${TENANT_ID:-default}"
 TIMELINE="${TIMELINE_ID:-main}"
 SEGSIZE=$((16 * 1024 * 1024))
@@ -19,7 +20,7 @@ START_LSN=$((LOGID * 4294967296 + SEG * SEGSIZE))
 END_LSN=$((START_LSN + SEGSIZE))
 
 exec qwal \
-  -safekeeper="$SAFEKEEPER_ADDR" \
+  -safekeepers="$SAFEKEEPER_ADDRS" \
   -tenant="$TENANT" \
   -timeline="$TIMELINE" \
   -start-lsn="$START_LSN" \

@@ -1,17 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,24 +21,32 @@ import (
 )
 
 func main() {
-	listen := env("LISTEN_ADDR", ":5454") // TCP QWAL from compute / walstreamer
-	httpAddr := env("HTTP_ADDR", ":8080") // restore / health (read path)
+	listen := env("LISTEN_ADDR", ":5454")
+	httpAddr := env("HTTP_ADDR", ":8080")
 	dataDir := env("DATA_DIR", "./data")
-	pageserver := env("PAGESERVER_URL", "http://127.0.0.1:8081")
+	token := env("QUAN_STORAGE_TOKEN", "")
+	if token == "" {
+		log.Fatal("QUAN_STORAGE_TOKEN is required")
+	}
+	peers := splitCSV(env("SAFEKEEPER_PEERS", ""))
 
 	store, err := wal.NewWal(dataDir)
 	if err != nil {
 		log.Fatalf("wal: %v", err)
 	}
 
-	ln, err := net.Listen("tcp", listen)
+	ln, err := listenTCP(listen)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("safekeeper tcp=%s http=%s data=%s pageserver=%s", listen, httpAddr, dataDir, pageserver)
+	tlsOn := os.Getenv("TLS_CERT_FILE") != "" && os.Getenv("TLS_KEY_FILE") != ""
+	log.Printf("safekeeper tcp=%s http=%s tls=%v data=%s peers=%v", listen, httpAddr, tlsOn, dataDir, peers)
 
-	go acceptLoop(ln, store, pageserver)
-	go serveHTTP(httpAddr, store)
+	go acceptLoop(ln, store, token)
+	go serveHTTP(httpAddr, store, token, dataDir)
+	if len(peers) > 0 {
+		go peerPullLoop(store, peers, token)
+	}
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -44,22 +54,40 @@ func main() {
 	_ = ln.Close()
 }
 
-func serveHTTP(addr string, store *wal.Wal) {
+func serveHTTP(addr string, store *wal.Wal, token, dataDir string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		probe := filepath.Join(dataDir, ".healthz_probe")
+		if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+			http.Error(w, "data dir not writable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = os.Remove(probe)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "role": "safekeeper"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "role": "safekeeper", "flush_lsn": store.MaxFlushLSN(),
+		})
 	})
-	mux.HandleFunc("/wal", walHTTP(store))
+	mux.HandleFunc("/wal", requireAuth(token, walHTTP(store)))
+	mux.HandleFunc("/metrics", requireAuth(token, metricsHTTP(store)))
 	log.Printf("safekeeper http listen %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := listenHTTP(addr, mux); err != nil {
 		log.Printf("safekeeper http: %v", err)
 	}
 }
 
-// walHTTP serves raw Postgres WAL payloads for restore_command / quanrestore.
-// GET /wal?tenant=&timeline=&list=1 → {"segnos":[...]}
-// GET /wal?tenant=&timeline=&segno=N → payload bytes + X-Start-LSN / X-End-LSN
+func metricsHTTP(store *wal.Wal) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# HELP safekeeper_append_total WAL appends\n")
+		fmt.Fprintf(w, "# TYPE safekeeper_append_total counter\n")
+		fmt.Fprintf(w, "safekeeper_append_total %d\n", store.Appends.Load())
+		fmt.Fprintf(w, "# HELP safekeeper_flush_lsn Highest durable flush LSN\n")
+		fmt.Fprintf(w, "# TYPE safekeeper_flush_lsn gauge\n")
+		fmt.Fprintf(w, "safekeeper_flush_lsn %d\n", store.MaxFlushLSN())
+	}
+}
+
 func walHTTP(store *wal.Wal) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -74,14 +102,23 @@ func walHTTP(store *wal.Wal) http.HandlerFunc {
 		if timeline == "" {
 			timeline = "main"
 		}
+		if err := wal.ValidateID(tenant); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := wal.ValidateID(timeline); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if q.Get("list") == "1" {
 			segnos, err := store.ListSegments(tenant, timeline)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			flush, _ := store.FlushLSN(tenant, timeline)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"segnos": segnos})
+			_ = json.NewEncoder(w).Encode(map[string]any{"segnos": segnos, "flush_lsn": flush})
 			return
 		}
 		segno, err := strconv.ParseUint(q.Get("segno"), 10, 64)
@@ -101,20 +138,30 @@ func walHTTP(store *wal.Wal) http.HandlerFunc {
 	}
 }
 
-func acceptLoop(ln net.Listener, store *wal.Wal, pageserverURL string) {
+func acceptLoop(ln net.Listener, store *wal.Wal, token string) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			return
 		}
-		go serveConn(conn, store, pageserverURL)
+		go serveConn(conn, store, token)
 	}
 }
 
-func serveConn(conn net.Conn, store *wal.Wal, pageserverURL string) {
+func serveConn(conn net.Conn, store *wal.Wal, token string) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	got, err := wal.ReadAuth(conn)
+	if err != nil {
+		log.Printf("auth %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		log.Printf("auth %s: bad token", conn.RemoteAddr())
+		return
+	}
 
 	for {
 		msg, err := wal.ReadAppendMsg(conn)
@@ -139,40 +186,94 @@ func serveConn(conn net.Conn, store *wal.Wal, pageserverURL string) {
 		}
 		log.Printf("wal append tenant=%s timeline=%s lsn=%d..%d ack=%d bytes=%d",
 			msg.TenantID, msg.TimelineID, msg.StartLSN, msg.EndLSN, flush, len(msg.Payload))
-		if pageserverURL != "" {
-			go forwardIngest(pageserverURL, msg.TenantID, msg.TimelineID, msg.StartLSN, msg.EndLSN, msg.Payload)
-		}
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 	}
 }
 
-func forwardIngest(base, tenant, timeline string, startLSN, endLSN uint64, payload []byte) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return
+func peerPullLoop(store *wal.Wal, peers []string, token string) {
+	cli := newHTTPClient(15 * time.Second)
+	for {
+		time.Sleep(5 * time.Second)
+		tls, err := store.ListTimelines()
+		if err != nil {
+			continue
+		}
+		if len(tls) == 0 {
+			tls = [][2]string{{"default", "main"}}
+		}
+		for _, pair := range tls {
+			tenant, timeline := pair[0], pair[1]
+			local, _ := store.ListSegments(tenant, timeline)
+			have := map[uint64]bool{}
+			for _, s := range local {
+				have[s] = true
+			}
+			for _, peer := range peers {
+				base := strings.TrimRight(peer, "/")
+				req, err := http.NewRequest(http.MethodGet,
+					fmt.Sprintf("%s/wal?tenant=%s&timeline=%s&list=1", base, tenant, timeline), nil)
+				if err != nil {
+					continue
+				}
+				req.Header.Set("Authorization", "Bearer "+token)
+				resp, err := cli.Do(req)
+				if err != nil {
+					continue
+				}
+				var body struct {
+					Segnos []uint64 `json:"segnos"`
+				}
+				_ = json.NewDecoder(resp.Body).Decode(&body)
+				resp.Body.Close()
+				if resp.StatusCode != 200 {
+					continue
+				}
+				for _, segno := range body.Segnos {
+					if have[segno] {
+						continue
+					}
+					if err := pullSegment(cli, store, base, token, tenant, timeline, segno); err != nil {
+						log.Printf("peer pull %s segno=%d: %v", peer, segno, err)
+						continue
+					}
+					have[segno] = true
+					log.Printf("peer pull tenant=%s timeline=%s segno=%d from %s", tenant, timeline, segno, peer)
+				}
+			}
+		}
 	}
-	u.Path = "/v1/ingest"
-	q := u.Query()
-	q.Set("tenant", tenant)
-	q.Set("timeline", timeline)
-	q.Set("start_lsn", strconv.FormatUint(startLSN, 10))
-	q.Set("end_lsn", strconv.FormatUint(endLSN, 10))
-	u.RawQuery = q.Encode()
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+func pullSegment(cli *http.Client, store *wal.Wal, base, token, tenant, timeline string, segno uint64) error {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/wal?tenant=%s&timeline=%s&segno=%d", base, tenant, timeline, segno), nil)
 	if err != nil {
-		return
+		return err
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cli.Do(req.WithContext(context.Background()))
 	if err != nil {
-		log.Printf("ingest fanout: %v", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return err
+	}
+	start, _ := strconv.ParseUint(resp.Header.Get("X-Start-LSN"), 10, 64)
+	end, _ := strconv.ParseUint(resp.Header.Get("X-End-LSN"), 10, 64)
+	if start == 0 {
+		start = segno * wal.PGSegmentSize
+	}
+	if end == 0 {
+		end = start + uint64(len(payload))
+	}
+	_ = store.CreateTimeline(tenant, timeline)
+	_, err = store.Append(tenant, timeline, start, end, payload)
+	return err
 }
 
 func env(key, def string) string {
@@ -180,4 +281,15 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
